@@ -16,8 +16,22 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
+    int ret_val = system(cmd);
 
-    return true;
+    // Return -2 if child process is not created successfully
+    if(ret_val == -1)
+    {
+        return false;
+    }
+
+    // WIFEXITED() returns 1 if successfully returned from child process
+    // WEXITSTATUS() returns exit status, 0 being success
+    if((WIFEXITED(ret_val)) && (WEXITSTATUS(ret_val) == 0))
+    {
+        return true;
+    }
+
+    return false;
 }
 
 /**
@@ -59,7 +73,27 @@ bool do_exec(int count, ...)
  *
 */
 
-    va_end(args);
+    pid_t pid = fork();
+
+    if(pid == -1)
+    {
+        return false;
+    }
+    else if(pid == 0)
+    {
+        execv(command[0], command);
+        return false;   // execv() never returns in child process
+    }
+    else if(pid > 0)
+    {
+        int status;
+        waitpid(pid, &status, 0);
+        if((WIFEXITED(status)) && (WEXITSTATUS(status) == 0))
+        {
+            return true;
+        }
+        return false;
+    }
 
     return true;
 }
@@ -80,20 +114,43 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
-
-
-/*
- * TODO
- *   Call execv, but first using https://stackoverflow.com/a/13784315/1446624 as a refernce,
- *   redirect standard out to a file specified by outputfile.
- *   The rest of the behaviour is same as do_exec()
- *
-*/
-
+    
     va_end(args);
 
-    return true;
+    // Reference: https://stackoverflow.com/a/13784315/1446624
+
+    int kidpid;
+    int fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+    if (fd < 0) 
+    {
+        perror("open");
+        return false;
+    }
+    
+    switch (kidpid = fork()) 
+    {
+        case -1: 
+            perror("fork");
+            return false;
+        case 0:
+            if (dup2(fd, 1) < 0) 
+            {
+                perror("dup2"); 
+                abort();
+            }
+            close(fd);
+            execv(command[0], command); 
+            perror("execv");
+            return false;
+        default:
+            close(fd);
+            int status;
+            waitpid(kidpid, &status, 0);
+            if((WIFEXITED(status)) && (WEXITSTATUS(status) == 0))
+            {
+                return true;
+            }
+    }
+
+    return false;
 }

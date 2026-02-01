@@ -1,6 +1,7 @@
 #include "systemcalls.h"
 #include "stdlib.h"
 #include <fcntl.h>
+#include <unistd.h>
 
 /**
  * @param cmd the command to execute with system()

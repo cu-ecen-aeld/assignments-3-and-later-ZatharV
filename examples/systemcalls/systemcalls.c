@@ -77,6 +77,12 @@ bool do_exec(int count, ...)
  *
 */
 
+    // Check if the path is absolute
+    if(command[0][0] != '/')
+    {
+        return false;
+    }
+
     pid_t pid = fork();
 
     if(pid == -1)

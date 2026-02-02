@@ -109,6 +109,8 @@ mkdir -p ${OUTDIR}/rootfs/home/conf
 cp ./conf/*.txt ${OUTDIR}/rootfs/home/conf
 cp ./autorun-qemu.sh ${OUTDIR}/rootfs/home/
 
+#reference: https://chatgpt.com/share/698029c2-f794-8001-a3ed-bf2d59118082
+
 # TODO: Chown the root directory
 cd ${OUTDIR}/rootfs
 sudo chown -R root:root ${OUTDIR}/rootfs

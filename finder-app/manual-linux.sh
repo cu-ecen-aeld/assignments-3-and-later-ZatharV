@@ -55,7 +55,7 @@ fi
 # Reference: Coursera Lecture on Linux rootfile system
 mkdir -p ${OUTDIR}/rootfs
 cd ${OUTDIR}/rootfs
-mkdir -p bin dev etc home lib lib64 proc sbin sys tmp usr var
+mkdir -p bin dev etc home init lib lib64 proc sbin sys tmp usr var
 mkdir -p usr/bin usr/lib usr/sbin
 mkdir -p var/log
 
@@ -102,15 +102,16 @@ make CROSS_COMPILE=${CROSS_COMPILE}
 
 # TODO: Copy the finder related scripts and executables to the /home directory
 # on the target rootfs
-cp finder*.sh ${OUTDIR}/rootfs/home
-#cp writer ${OUTDIR}/rootfs
+cp ./finder-test.sh ${OUTDIR}/rootfs/home
+cp ./finder.sh ${OUTDIR}/rootfs/home
+cp ./writer ${OUTDIR}/rootfs/home
 mkdir -p ${OUTDIR}/rootfs/home/conf
-cp conf/*.txt ${OUTDIR}/rootfs/home/conf
-cp autorun-qemu.sh ${OUTDIR}/rootfs/home/
+cp ./conf/*.txt ${OUTDIR}/rootfs/home/conf
+cp ./autorun-qemu.sh ${OUTDIR}/rootfs/home/
 
 # TODO: Chown the root directory
 cd ${OUTDIR}/rootfs
-sudo chown -R root:root /
+sudo chown -R root:root ${OUTDIR}/rootfs
 
 # TODO: Create initramfs.cpio.gz
 find . | cpio -H newc -ov --owner root:root > ${OUTDIR}/initramfs.cpio

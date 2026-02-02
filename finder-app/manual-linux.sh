@@ -110,6 +110,7 @@ cp ./conf/*.txt ${OUTDIR}/rootfs/home/conf
 cp ./autorun-qemu.sh ${OUTDIR}/rootfs/home/
 
 #reference: https://chatgpt.com/share/698029c2-f794-8001-a3ed-bf2d59118082
+#reference: https://copilot.microsoft.com/shares/zmbeBXc1jYcSbeWHdnLyX
 
 # TODO: Chown the root directory
 cd ${OUTDIR}/rootfs

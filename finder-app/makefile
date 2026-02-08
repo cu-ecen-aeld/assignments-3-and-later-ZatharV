@@ -1,28 +1,13 @@
-# Compiler and flags
-CC = $(CROSS_COMPILE)gcc
-CFLAGS = -Wall -Werror
+# Author: Atharv More
 
-# Target executable
-TARGET = writer
+CROSS_COMPILE ?=
 
-# Source files
-SRCS = writer.c
-OBJS = $(SRCS:.c=.o)
+all: writer
 
-# Default target: build the writer application
-all: $(TARGET)
+default: writer
 
-# Build the writer executable
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
+writer:
+	$(CROSS_COMPILE)gcc -Wall -Werror writer.c -o writer
 
-# Compile source files to object files
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# Clean target: remove the application and object files
 clean:
-	rm -f $(TARGET) $(OBJS)
-
-# Phony targets
-.PHONY: all clean
+	rm -f writer *.o

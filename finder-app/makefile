@@ -1,8 +1,12 @@
 # Author: Atharv More
 
-CROSS_COMPILE ?= 
+CROSS_COMPILE ?=
 
-default:
+all: writer
+
+default: writer
+
+writer:
 	$(CROSS_COMPILE)gcc -Wall -Werror writer.c -o writer
 
 clean:

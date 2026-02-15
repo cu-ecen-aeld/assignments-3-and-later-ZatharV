@@ -1,13 +1,14 @@
 # Author: Atharv More
 
-CROSS_COMPILE ?=
+CC ?= $(CROSS_COMPILE)gcc
+CFLAGS ?= -Wall -Werror
 
 all: writer
 
 default: writer
 
 writer:
-	$(CROSS_COMPILE)gcc -Wall -Werror writer.c -o writer
+	$(CC) $(CFLAGS) writer.c -o writer
 
 clean:
 	rm -f writer *.o

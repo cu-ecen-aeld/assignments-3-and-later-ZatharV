@@ -2,140 +2,150 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <syslog.h>
-#include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <signal.h>
+#include <syslog.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <errno.h>
 
 #define PORT 9000
-#define DATA_FILE "/var/tmp/aesdsocketdata"
-#define BUF_SIZE 1024
+#define DATAFILE "/var/tmp/aesdsocketdata"
 
-int server_fd = -1;
-int data_fd = -1;
+static volatile sig_atomic_t exit_requested = 0;
+int sockfd = -1;
+int clientfd = -1;
 
-// Signal handler to ensure clean exit and file removal
-void handle_signal(int sig) {
-    if (sig == SIGINT || sig == SIGTERM) {
-        syslog(LOG_INFO, "Caught signal, exiting");
-        
-        if (server_fd != -1) close(server_fd);
-        // Delete the data file as required by the assignment
-        remove(DATA_FILE);
-        closelog();
-        exit(0);
-    }
+void signal_handler(int sig)
+{
+    syslog(LOG_INFO, "Caught signal, exiting");
+    exit_requested = 1;
 }
 
-int main(int argc, char *argv[]) {
-    int daemon_mode = 0;
-    if (argc > 1 && strcmp(argv[1], "-d") == 0) {
-        daemon_mode = 1;
-    }
+int main(int argc, char *argv[])
+{
+    struct sockaddr_in serv_addr, client_addr;
+    socklen_t addr_len = sizeof(client_addr);
 
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
-    // Setup signal handling
+    // Install signal handlers
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = handle_signal;
+    sa.sa_handler = signal_handler;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    // Create and configure socket
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
-        syslog(LOG_ERR, "Socket creation failed: %m");
+    // 1. Create socket
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        syslog(LOG_ERR, "socket() failed");
+        perror("socket");
         return -1;
     }
 
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    // 2. Bind to port 9000
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serv_addr.sin_port = htons(PORT);
 
-    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        syslog(LOG_ERR, "Bind failed: %m");
-        close(server_fd);
+    if (bind(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        syslog(LOG_ERR, "bind() failed");
+        perror("bind");
+        close(sockfd);
         return -1;
     }
 
-    // Daemonize if requested via -d argument
-    if (daemon_mode) {
-        pid_t pid = fork();
-        if (pid < 0) return -1;
-        if (pid > 0) exit(0); // Parent exits
-        
-        if (setsid() < 0) return -1;
-        chdir("/");
-        int devnull = open("/dev/null", O_RDWR);
-        dup2(devnull, STDIN_FILENO);
-        dup2(devnull, STDOUT_FILENO);
-        dup2(devnull, STDERR_FILENO);
-        close(devnull);
-    }
-
-    if (listen(server_fd, 10) < 0) {
-        syslog(LOG_ERR, "Listen failed: %m");
-        close(server_fd);
+    // 3. Listen
+    if (listen(sockfd, 10) < 0) {
+        syslog(LOG_ERR, "listen() failed");
+        perror("listen");
+        close(sockfd);
         return -1;
     }
 
-    while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-        
-        if (client_fd == -1) continue;
+    // 4. Accept loop
+    while (!exit_requested) {
+
+        clientfd = accept(sockfd, (struct sockaddr *)&client_addr, &addr_len);
+        if (clientfd < 0) {
+            if (exit_requested) break;  // interrupted by signal
+            syslog(LOG_ERR, "accept() failed");
+            perror("accept");
+            continue;
+        }
 
         char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
-        // Open/Create the data file for appending
-        data_fd = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
-        
-        char *recv_buffer = malloc(BUF_SIZE);
-        ssize_t bytes_received;
-        size_t total_received = 0;
+        // Receive buffer
+        char recvbuf[1024];
+        size_t total_len = 0;
+        char *packet = NULL;
 
-        // Loop receiving until a newline (\n) is found
-        while ((bytes_received = recv(client_fd, recv_buffer + total_received, BUF_SIZE - 1, 0)) > 0) {
-            total_received += bytes_received;
-            // Check for newline in the newly received chunk
-            if (memchr(recv_buffer + (total_received - bytes_received), '\n', bytes_received)) {
+        // 5. Receive until newline
+        while (!exit_requested) {
+            ssize_t bytes = recv(clientfd, recvbuf, sizeof(recvbuf), 0);
+            if (bytes <= 0) break;
+
+            char *newbuf = realloc(packet, total_len + bytes);
+            if (!newbuf) {
+                syslog(LOG_ERR, "malloc failed");
+                free(packet);
+                packet = NULL;
                 break;
             }
-            recv_buffer = realloc(recv_buffer, total_received + BUF_SIZE);
+            packet = newbuf;
+
+            memcpy(packet + total_len, recvbuf, bytes);
+            total_len += bytes;
+
+            if (memchr(recvbuf, '\n', bytes)) break;
         }
 
-        // Write the full packet to the file
-        write(data_fd, recv_buffer, total_received);
-
-        // --- CRITICAL FIX: RESET FILE POINTER TO START ---
-        lseek(data_fd, 0, SEEK_SET);
-        
-
-        // Read the entire cumulative file and send back to client
-        char send_buf[BUF_SIZE];
-        ssize_t r_bytes;
-        while ((r_bytes = read(data_fd, send_buf, BUF_SIZE)) > 0) {
-            send(client_fd, send_buf, r_bytes, 0);
+        // 6. Append packet to file
+        if (packet) {
+            int fd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd < 0) {
+                syslog(LOG_ERR, "open() failed for data file");
+            } else {
+                write(fd, packet, total_len);
+                close(fd);
+            }
+            free(packet);
         }
 
-        // Cleanup for this connection
-        close(client_fd);
-        close(data_fd);
-        free(recv_buffer);
+        // 7. Send full file back
+        int fd = open(DATAFILE, O_RDONLY);
+        if (fd >= 0) {
+            char filebuf[1024];
+            ssize_t r;
+            while ((r = read(fd, filebuf, sizeof(filebuf))) > 0) {
+                send(clientfd, filebuf, r, 0);
+            }
+            close(fd);
+        }
+
+        // 8. Close connection
         syslog(LOG_INFO, "Closed connection from %s", client_ip);
+        close(clientfd);
+        clientfd = -1;
     }
 
+    // Cleanup on exit
+    if (clientfd != -1) close(clientfd);
+    if (sockfd != -1) close(sockfd);
+
+    remove(DATAFILE);
+
+    closelog();
     return 0;
 }
+

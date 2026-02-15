@@ -1,8 +1,8 @@
 # Author: Atharv More
 #aesdsocket makefile
 
-CC ?= $(CROSS_COMPILE)gcc
-CFLAGS ?= -Wall -Werror -g -O0
+CC = $(CROSS_COMPILE)gcc
+CFLAGS = -Wall -Werror -g -O0
 LDFLAGS ?= -pthread
 
 all: aesdsocket

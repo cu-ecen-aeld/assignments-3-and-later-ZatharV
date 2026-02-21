@@ -1,10 +1,7 @@
 /**
- * 
  * @file    aesdsocket.c
  * @author  Atharv More
- * @ref     https://gemini.google.com/share/3aa11fc7e916
- * @date    02/14/2026
- * 
+ * @date    02/21/2026
  */
 
 #include <stdio.h>
@@ -19,119 +16,154 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pthread.h>
+#include <time.h>
+#include <stdbool.h>
+#include <sys/queue.h>
 
 #define PORT 9000
 #define DATA_FILE "/var/tmp/aesdsocketdata"
 #define BUF_SIZE 1024
 
-int server_fd = -1;
-int data_fd = -1;
+#ifndef SLIST_FOREACH_SAFE
+#define SLIST_FOREACH_SAFE(var, head, field, tvar)           \
+    for ((var) = SLIST_FIRST((head));                        \
+        (var) && ((tvar) = SLIST_NEXT((var), field), 1);     \
+        (var) = (tvar))
+#endif
 
-// Signal handler to ensure clean exit and file removal
+// Thread structure for the linked list
+struct thread_data {
+    pthread_t thread_id;
+    int client_fd;
+    struct sockaddr_in client_addr;
+    bool thread_complete;
+    SLIST_ENTRY(thread_data) entries;
+};
+
+// Global variables for access in signal handler and threads
+int server_fd = -1;
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+volatile bool exit_requested = false;
+
+// Initialize the head of the linked list
+SLIST_HEAD(slisthead, thread_data) head = SLIST_HEAD_INITIALIZER(head);
+
+// Signal handler for graceful shutdown
 void signal_handler(int sig) {
-    if (sig == SIGINT || sig == SIGTERM) 
-    {
-        syslog(LOG_INFO, "Sinal received: %s", (sig == SIGINT) ? "SIGINT" : ((sig == SIGTERM) ? "SIGTERM": ""));
-        
-        // If server_fd is created then close ir
-        if (server_fd != -1) 
-        {
-            close(server_fd);
-        }
-        remove(DATA_FILE);
-        closelog();
-        exit(0);
+    syslog(LOG_INFO, "Caught signal, exiting");
+    exit_requested = true;
+    if (server_fd != -1) {
+        // Shutdown to unblock accept()
+        shutdown(server_fd, SHUT_RDWR);
     }
 }
 
-/**
- * @brief   Checks if the program should be in daemon mode
- * 
- * @return  1 if daemon
- *          0 otherwise
- */
-int is_daemon_mode(int argc, char *argv[])
-{
-    if (argc > 1 && strcmp(argv[1], "-d") == 0)
-        return 1;
-    else
-        return 0;
+// Thread function to handle client communication
+void* thread_handler(void* arg) {
+    struct thread_data* data = (struct thread_data*)arg;
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &data->client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+
+    char *recv_buffer = malloc(BUF_SIZE);
+    if (!recv_buffer) goto thread_exit;
+
+    ssize_t bytes_received;
+    size_t total_received = 0;
+
+    // Receive data until newline
+    while ((bytes_received = recv(data->client_fd, recv_buffer + total_received, BUF_SIZE - 1, 0)) > 0) {
+        total_received += bytes_received;
+        recv_buffer[total_received] = '\0';
+        if (strchr(recv_buffer, '\n')) break;
+        
+        recv_buffer = realloc(recv_buffer, total_received + BUF_SIZE);
+    }
+
+    // Synchronize file access
+    pthread_mutex_lock(&file_mutex);
+    
+    int fd = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+    if (fd != -1) {
+        write(fd, recv_buffer, total_received);
+        lseek(fd, 0, SEEK_SET);
+
+        char send_buf[BUF_SIZE];
+        ssize_t r_bytes;
+        while ((r_bytes = read(fd, send_buf, BUF_SIZE)) > 0) {
+            send(data->client_fd, send_buf, r_bytes, 0);
+        }
+        close(fd);
+    }
+    
+    pthread_mutex_unlock(&file_mutex);
+
+    free(recv_buffer);
+    close(data->client_fd);
+    syslog(LOG_INFO, "Closed connection from %s", client_ip);
+
+thread_exit:
+    data->thread_complete = true;
+    return arg;
 }
 
-/**
- * @brief Sets signal Handing
- */
-void set_signal_handling()
-{
-    // Setup signal handling
-    struct sigaction sig_action = {0};
-    sig_action.sa_handler = signal_handler;
-    sigaction(SIGINT, &sig_action, NULL);
-    sigaction(SIGTERM, &sig_action, NULL);
+// Timer thread function to append timestamps
+void* timer_handler(void* arg) {
+    while (!exit_requested) {
+        for (int i = 0; i < 10 && !exit_requested; i++) {
+            sleep(1);
+        }
+        if (exit_requested) break;
+
+        time_t rawtime;
+        struct tm *info;
+        char time_str[100];
+
+        time(&rawtime);
+        info = localtime(&rawtime);
+        size_t len = strftime(time_str, sizeof(time_str), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", info);
+
+        pthread_mutex_lock(&file_mutex);
+        int fd = open(DATA_FILE, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (fd != -1) {
+            write(fd, time_str, len);
+            close(fd);
+        }
+        pthread_mutex_unlock(&file_mutex);
+    }
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    int daemon_mode = is_daemon_mode(argc, argv);
-
-    // Open Logs
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
-    // Signal handling is important for SIGINT and SIGTERM
-    set_signal_handling();
+    // Setup signal handling
+    struct sigaction sa = {0};
+    sa.sa_handler = signal_handler;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
-    // Create and configure socket
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) 
-    {
-        syslog(LOG_ERR, "Create Socket: Failed");
-        closelog();
-        return -1;
-    }
-
     int opt = 1;
-    if(setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1)
-    {
-        syslog(LOG_ERR, "setsockopt: Failed");
-        close(server_fd);
-        closelog();
-        return -1;
-    }
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT);        // Convert port to Network Byte Order
-    addr.sin_addr.s_addr = INADDR_ANY;  // Bind to all available interfaces
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        syslog(LOG_ERR, "Bind: failed");
-        close(server_fd);
+        perror("Bind failed");
         return -1;
     }
 
-
-    // In daemon mode, it should run in the background
-    if (daemon_mode) 
-    {
+    // Daemonize before starting any threads
+    if (argc > 1 && strcmp(argv[1], "-d") == 0) {
         pid_t pid = fork();
-
-        if (pid < 0)
-        {
-            syslog(LOG_ERR, "Forking failed in daemon mode");
-            closelog();
-            return -1;
-        }
-
-        if (pid > 0) 
-            exit(0); // In daemon mode, parent exits
-        
-        if (setsid() < 0) 
-        {
-            return -1;
-        }
-
-        chdir("/"); // Change to root dir
-
-        // Redirect standard files to /dev/null
+        if (pid < 0) return -1;
+        if (pid > 0) exit(0);
+        setsid();
+        chdir("/");
         int devnull = open("/dev/null", O_RDWR);
         dup2(devnull, STDIN_FILENO);
         dup2(devnull, STDOUT_FILENO);
@@ -139,61 +171,52 @@ int main(int argc, char *argv[]) {
         close(devnull);
     }
 
-    // Listen to connection
-    if (listen(server_fd, 10) < 0)
-    {
-        syslog(LOG_ERR, "Listen: Failed");
-        close(server_fd);
-        return -1;
-    }
+    if (listen(server_fd, 10) < 0) return -1;
 
-    while(1) 
-    {
+    // Start Timer Thread
+    pthread_t timer_tid;
+    pthread_create(&timer_tid, NULL, timer_handler, NULL);
+
+    // Accept loop
+    while (!exit_requested) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-        
-        if (client_fd == -1) 
-        {
-            continue;
-        }
 
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-        syslog(LOG_INFO, "Accepted connection from %s", client_ip);
+        if (client_fd == -1) continue;
 
-        data_fd = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
-        
-        char *recv_buffer = malloc(BUF_SIZE);
-        ssize_t bytes_received;
-        size_t total_received = 0;
+        struct thread_data* t_node = malloc(sizeof(struct thread_data));
+        t_node->client_fd = client_fd;
+        t_node->client_addr = client_addr;
+        t_node->thread_complete = false;
 
-        while ((bytes_received = recv(client_fd, recv_buffer + total_received, BUF_SIZE - 1, 0)) > 0) 
-        {
-            total_received += bytes_received;
-            if (memchr(recv_buffer + (total_received - bytes_received), '\n', bytes_received)) {
-                break;
+        pthread_create(&t_node->thread_id, NULL, thread_handler, t_node);
+        SLIST_INSERT_HEAD(&head, t_node, entries);
+
+        // Join completed threads
+        struct thread_data *it, *tmp_it;
+        SLIST_FOREACH_SAFE(it, &head, entries, tmp_it) {
+            if (it->thread_complete) {
+                pthread_join(it->thread_id, NULL);
+                SLIST_REMOVE(&head, it, thread_data, entries);
+                free(it);
             }
-            recv_buffer = realloc(recv_buffer, total_received + BUF_SIZE);
         }
-
-
-        write(data_fd, recv_buffer, total_received);
-        lseek(data_fd, 0, SEEK_SET);
-        
-
-        char send_buf[BUF_SIZE];
-        ssize_t r_bytes;
-        while ((r_bytes = read(data_fd, send_buf, BUF_SIZE)) > 0) 
-        {
-            send(client_fd, send_buf, r_bytes, 0);
-        }
-
-        close(client_fd);
-        close(data_fd);
-        free(recv_buffer);
-        syslog(LOG_INFO, "Closed connection from %s", client_ip);
     }
+
+    // Cleanup logic
+    pthread_join(timer_tid, NULL);
+    while (!SLIST_EMPTY(&head)) {
+        struct thread_data* it = SLIST_FIRST(&head);
+        pthread_join(it->thread_id, NULL);
+        SLIST_REMOVE_HEAD(&head, entries);
+        free(it);
+    }
+
+    pthread_mutex_destroy(&file_mutex);
+    close(server_fd);
+    remove(DATA_FILE);
+    closelog();
 
     return 0;
 }

@@ -1,7 +1,7 @@
 /**
  * @file    aesdsocket.c
  * @author  Atharv More
- * @date    02/21/2026
+ * @date    02/22/2026
  */
 
 #include <stdio.h>
@@ -20,11 +20,14 @@
 #include <time.h>
 #include <stdbool.h>
 #include <sys/queue.h>
+#include <sys/stat.h>
 
 #define PORT 9000
 #define DATA_FILE "/var/tmp/aesdsocketdata"
 #define BUF_SIZE 1024
+#define MAX_FILE_SIZE (1024 * 1024 * 1024) // 1GB Safety Limit
 
+// Ensure SLIST_FOREACH_SAFE is defined for older systems
 #ifndef SLIST_FOREACH_SAFE
 #define SLIST_FOREACH_SAFE(var, head, field, tvar)           \
     for ((var) = SLIST_FIRST((head));                        \
@@ -41,7 +44,7 @@ struct thread_data {
     SLIST_ENTRY(thread_data) entries;
 };
 
-// Global variables for access in signal handler and threads
+// Global variables
 int server_fd = -1;
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 volatile bool exit_requested = false;
@@ -54,7 +57,6 @@ void signal_handler(int sig) {
     syslog(LOG_INFO, "Caught signal, exiting");
     exit_requested = true;
     if (server_fd != -1) {
-        // Shutdown to unblock accept()
         shutdown(server_fd, SHUT_RDWR);
     }
 }
@@ -71,31 +73,48 @@ void* thread_handler(void* arg) {
     ssize_t bytes_received;
     size_t total_received = 0;
 
-    // Receive data until newline
-    while ((bytes_received = recv(data->client_fd, recv_buffer + total_received, BUF_SIZE - 1, 0)) > 0) {
+    // Receive data until newline is found
+    while (!exit_requested) {
+        bytes_received = recv(data->client_fd, recv_buffer + total_received, BUF_SIZE - 1, 0);
+        if (bytes_received <= 0) break;
+
+        // Check only the newly arrived bytes for a newline
+        char *newline_ptr = memchr(recv_buffer + total_received, '\n', bytes_received);
         total_received += bytes_received;
-        recv_buffer[total_received] = '\0';
-        if (strchr(recv_buffer, '\n')) break;
-        
-        recv_buffer = realloc(recv_buffer, total_received + BUF_SIZE);
+
+        if (newline_ptr != NULL) break;
+
+        // Reallocate buffer if needed
+        char *new_ptr = realloc(recv_buffer, total_received + BUF_SIZE);
+        if (!new_ptr) {
+            syslog(LOG_ERR, "Failed to reallocate buffer");
+            free(recv_buffer);
+            goto thread_exit;
+        }
+        recv_buffer = new_ptr;
     }
 
     // Synchronize file access
     pthread_mutex_lock(&file_mutex);
     
-    int fd = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
-    if (fd != -1) {
-        write(fd, recv_buffer, total_received);
-        lseek(fd, 0, SEEK_SET);
+    // Safety check for disk space
+    struct stat st;
+    if (stat(DATA_FILE, &st) == 0 && st.st_size > MAX_FILE_SIZE) {
+        syslog(LOG_ERR, "Safety limit reached! File > 1GB. Stopping write.");
+    } else {
+        int fd = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+        if (fd != -1) {
+            write(fd, recv_buffer, total_received);
+            lseek(fd, 0, SEEK_SET);
 
-        char send_buf[BUF_SIZE];
-        ssize_t r_bytes;
-        while ((r_bytes = read(fd, send_buf, BUF_SIZE)) > 0) {
-            send(data->client_fd, send_buf, r_bytes, 0);
+            char send_buf[BUF_SIZE];
+            ssize_t r_bytes;
+            while ((r_bytes = read(fd, send_buf, BUF_SIZE)) > 0) {
+                send(data->client_fd, send_buf, r_bytes, 0);
+            }
+            close(fd);
         }
-        close(fd);
     }
-    
     pthread_mutex_unlock(&file_mutex);
 
     free(recv_buffer);
@@ -107,12 +126,15 @@ thread_exit:
     return arg;
 }
 
-// Timer thread function to append timestamps
+// Timer thread function to append RFC 2822 timestamps every 10 seconds
 void* timer_handler(void* arg) {
     while (!exit_requested) {
-        for (int i = 0; i < 10 && !exit_requested; i++) {
-            sleep(1);
+        // Robust sleep that handles interruptions
+        unsigned int time_to_sleep = 10;
+        while (time_to_sleep > 0 && !exit_requested) {
+            time_to_sleep = sleep(time_to_sleep);
         }
+
         if (exit_requested) break;
 
         time_t rawtime;
@@ -121,6 +143,7 @@ void* timer_handler(void* arg) {
 
         time(&rawtime);
         info = localtime(&rawtime);
+        // RFC 2822 format
         size_t len = strftime(time_str, sizeof(time_str), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", info);
 
         pthread_mutex_lock(&file_mutex);
@@ -144,6 +167,8 @@ int main(int argc, char *argv[]) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1) return -1;
+
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -154,10 +179,11 @@ int main(int argc, char *argv[]) {
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("Bind failed");
+        close(server_fd);
         return -1;
     }
 
-    // Daemonize before starting any threads
+    // Daemonize if -d flag is provided
     if (argc > 1 && strcmp(argv[1], "-d") == 0) {
         pid_t pid = fork();
         if (pid < 0) return -1;
@@ -171,7 +197,10 @@ int main(int argc, char *argv[]) {
         close(devnull);
     }
 
-    if (listen(server_fd, 10) < 0) return -1;
+    if (listen(server_fd, 10) < 0) {
+        close(server_fd);
+        return -1;
+    }
 
     // Start Timer Thread
     pthread_t timer_tid;
@@ -183,9 +212,16 @@ int main(int argc, char *argv[]) {
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
 
-        if (client_fd == -1) continue;
+        if (client_fd == -1) {
+            if (exit_requested) break;
+            continue;
+        }
 
         struct thread_data* t_node = malloc(sizeof(struct thread_data));
+        if (!t_node) {
+            close(client_fd);
+            continue;
+        }
         t_node->client_fd = client_fd;
         t_node->client_addr = client_addr;
         t_node->thread_complete = false;
@@ -193,7 +229,7 @@ int main(int argc, char *argv[]) {
         pthread_create(&t_node->thread_id, NULL, thread_handler, t_node);
         SLIST_INSERT_HEAD(&head, t_node, entries);
 
-        // Join completed threads
+        // Periodically join completed threads
         struct thread_data *it, *tmp_it;
         SLIST_FOREACH_SAFE(it, &head, entries, tmp_it) {
             if (it->thread_complete) {
@@ -216,6 +252,7 @@ int main(int argc, char *argv[]) {
     pthread_mutex_destroy(&file_mutex);
     close(server_fd);
     remove(DATA_FILE);
+    syslog(LOG_INFO, "Server shutdown complete");
     closelog();
 
     return 0;

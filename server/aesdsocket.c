@@ -1,7 +1,9 @@
 /**
- * @file    aesdsocket.c
- * @author  Atharv More
- * @date    02/22/2026
+ * @file      aesdsocket.c
+ * @author    Atharv More
+ * @brief     Full implementation of multi-threaded socket server with 
+ * synchronized file I/O and periodic timestamping.
+ * @date      02/14/2026
  */
 
 #include <stdio.h>
@@ -17,91 +19,105 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
-#include <time.h>
-#include <stdbool.h>
 #include <sys/queue.h>
-#include <sys/stat.h>
+#include <time.h>
 
 #define PORT 9000
 #define DATA_FILE "/var/tmp/aesdsocketdata"
 #define BUF_SIZE 1024
-#define MAX_FILE_SIZE (1024 * 1024 * 1024) // 1GB Safety Limit
 
-// Ensure SLIST_FOREACH_SAFE is defined for older systems
-#ifndef SLIST_FOREACH_SAFE
-#define SLIST_FOREACH_SAFE(var, head, field, tvar)           \
-    for ((var) = SLIST_FIRST((head));                        \
-        (var) && ((tvar) = SLIST_NEXT((var), field), 1);     \
-        (var) = (tvar))
-#endif
-
-// Thread structure for the linked list
-struct thread_data {
+// Thread management structure
+struct thread_data_s {
     pthread_t thread_id;
     int client_fd;
-    struct sockaddr_in client_addr;
-    bool thread_complete;
-    SLIST_ENTRY(thread_data) entries;
+    char client_ip[INET_ADDRSTRLEN];
+    int complete_flag; 
+    SLIST_ENTRY(thread_data_s) entries;
 };
 
 // Global variables
 int server_fd = -1;
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
-volatile bool exit_requested = false;
-
-// Initialize the head of the linked list
-SLIST_HEAD(slisthead, thread_data) head = SLIST_HEAD_INITIALIZER(head);
+volatile sig_atomic_t keep_running = 1;
 
 // Signal handler for graceful shutdown
 void signal_handler(int sig) {
-    syslog(LOG_INFO, "Caught signal, exiting");
-    exit_requested = true;
-    if (server_fd != -1) {
-        shutdown(server_fd, SHUT_RDWR);
+    if (sig == SIGINT || sig == SIGTERM) {
+        syslog(LOG_INFO, "Caught signal, exiting");
+        keep_running = 0;
+        if (server_fd != -1) {
+            shutdown(server_fd, SHUT_RDWR);
+        }
     }
 }
 
-// Thread function to handle client communication
-void* thread_handler(void* arg) {
-    struct thread_data* data = (struct thread_data*)arg;
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &data->client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+/**
+ * Timer thread: Appends RFC 2822 timestamp every 10 seconds
+ */
+void* timestamp_handler(void* thread_param) {
+    while (keep_running) {
+        // Sleep in 1s increments to allow faster exit on shutdown
+        for (int i = 0; i < 10 && keep_running; i++) {
+            sleep(1);
+        }
+        if (!keep_running) break;
 
+        time_t rawtime;
+        struct tm *info;
+        char time_buf[100];
+        char final_str[150];
+
+        time(&rawtime);
+        info = localtime(&rawtime);
+        
+        // RFC 2822 format: %a, %d %b %Y %T %z
+        strftime(time_buf, sizeof(time_buf), "%a, %d %b %Y %T %z", info);
+        int len = snprintf(final_str, sizeof(final_str), "timestamp:%s\n", time_buf);
+
+        pthread_mutex_lock(&file_mutex);
+        int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd != -1) {
+            write(fd, final_str, len);
+            close(fd);
+        }
+        pthread_mutex_unlock(&file_mutex);
+    }
+    return NULL;
+}
+
+/**
+ * Connection thread: Handles individual client RX/TX
+ */
+void* thread_handler(void* thread_param) {
+    struct thread_data_s* data = (struct thread_data_s*)thread_param;
     char *recv_buffer = malloc(BUF_SIZE);
-    if (!recv_buffer) goto thread_exit;
+    if (!recv_buffer) goto cleanup;
 
     ssize_t bytes_received;
     size_t total_received = 0;
+    size_t current_buf_size = BUF_SIZE;
 
-    // Receive data until newline is found
-    while (!exit_requested) {
-        bytes_received = recv(data->client_fd, recv_buffer + total_received, BUF_SIZE - 1, 0);
+    // Receive data until newline
+    while (keep_running) {
+        bytes_received = recv(data->client_fd, recv_buffer + total_received, current_buf_size - total_received - 1, 0);
         if (bytes_received <= 0) break;
 
-        // Check only the newly arrived bytes for a newline
-        char *newline_ptr = memchr(recv_buffer + total_received, '\n', bytes_received);
         total_received += bytes_received;
+        recv_buffer[total_received] = '\0';
 
-        if (newline_ptr != NULL) break;
-
-        // Reallocate buffer if needed
-        char *new_ptr = realloc(recv_buffer, total_received + BUF_SIZE);
-        if (!new_ptr) {
-            syslog(LOG_ERR, "Failed to reallocate buffer");
-            free(recv_buffer);
-            goto thread_exit;
+        if (memchr(recv_buffer + (total_received - bytes_received), '\n', bytes_received)) {
+            break;
         }
+
+        current_buf_size += BUF_SIZE;
+        char *new_ptr = realloc(recv_buffer, current_buf_size);
+        if (!new_ptr) goto cleanup;
         recv_buffer = new_ptr;
     }
 
-    // Synchronize file access
-    pthread_mutex_lock(&file_mutex);
-    
-    // Safety check for disk space
-    struct stat st;
-    if (stat(DATA_FILE, &st) == 0 && st.st_size > MAX_FILE_SIZE) {
-        syslog(LOG_ERR, "Safety limit reached! File > 1GB. Stopping write.");
-    } else {
+    if (total_received > 0) {
+        pthread_mutex_lock(&file_mutex);
+        
         int fd = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
         if (fd != -1) {
             write(fd, recv_buffer, total_received);
@@ -114,77 +130,36 @@ void* thread_handler(void* arg) {
             }
             close(fd);
         }
-    }
-    pthread_mutex_unlock(&file_mutex);
-
-    free(recv_buffer);
-    close(data->client_fd);
-    syslog(LOG_INFO, "Closed connection from %s", client_ip);
-
-thread_exit:
-    data->thread_complete = true;
-    return arg;
-}
-
-// Timer thread function to append RFC 2822 timestamps every 10 seconds
-void* timer_handler(void* arg) {
-    while (!exit_requested) {
-        // Robust sleep that handles interruptions
-        unsigned int time_to_sleep = 10;
-        while (time_to_sleep > 0 && !exit_requested) {
-            time_to_sleep = sleep(time_to_sleep);
-        }
-
-        if (exit_requested) break;
-
-        time_t rawtime;
-        struct tm *info;
-        char time_str[100];
-
-        time(&rawtime);
-        info = localtime(&rawtime);
-        // RFC 2822 format
-        size_t len = strftime(time_str, sizeof(time_str), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", info);
-
-        pthread_mutex_lock(&file_mutex);
-        int fd = open(DATA_FILE, O_WRONLY | O_APPEND | O_CREAT, 0644);
-        if (fd != -1) {
-            write(fd, time_str, len);
-            close(fd);
-        }
         pthread_mutex_unlock(&file_mutex);
     }
+
+cleanup:
+    if (recv_buffer) free(recv_buffer);
+    close(data->client_fd);
+    syslog(LOG_INFO, "Closed connection from %s", data->client_ip);
+    data->complete_flag = 1;
     return NULL;
 }
 
 int main(int argc, char *argv[]) {
+    int daemon_mode = (argc > 1 && strcmp(argv[1], "-d") == 0);
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
-    // Setup signal handling
-    struct sigaction sa = {0};
-    sa.sa_handler = signal_handler;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    struct sigaction sig_action = {.sa_handler = signal_handler};
+    sigaction(SIGINT, &sig_action, NULL);
+    sigaction(SIGTERM, &sig_action, NULL);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) return -1;
-
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(PORT), .sin_addr.s_addr = INADDR_ANY};
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("Bind failed");
-        close(server_fd);
         return -1;
     }
 
-    // Daemonize if -d flag is provided
-    if (argc > 1 && strcmp(argv[1], "-d") == 0) {
+    if (daemon_mode) {
         pid_t pid = fork();
         if (pid < 0) return -1;
         if (pid > 0) exit(0);
@@ -197,63 +172,65 @@ int main(int argc, char *argv[]) {
         close(devnull);
     }
 
-    if (listen(server_fd, 10) < 0) {
-        close(server_fd);
-        return -1;
-    }
+    listen(server_fd, 10);
 
-    // Start Timer Thread
-    pthread_t timer_tid;
-    pthread_create(&timer_tid, NULL, timer_handler, NULL);
+    SLIST_HEAD(slisthead, thread_data_s) head;
+    SLIST_INIT(&head);
 
-    // Accept loop
-    while (!exit_requested) {
+    pthread_t timer_thread;
+    pthread_create(&timer_thread, NULL, timestamp_handler, NULL);
+
+    while(keep_running) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-
+        
         if (client_fd == -1) {
-            if (exit_requested) break;
+            if (errno == EINTR || !keep_running) break;
             continue;
         }
 
-        struct thread_data* t_node = malloc(sizeof(struct thread_data));
-        if (!t_node) {
+        struct thread_data_s* new_thread = malloc(sizeof(struct thread_data_s));
+        new_thread->client_fd = client_fd;
+        new_thread->complete_flag = 0;
+        inet_ntop(AF_INET, &client_addr.sin_addr, new_thread->client_ip, INET_ADDRSTRLEN);
+        
+        syslog(LOG_INFO, "Accepted connection from %s", new_thread->client_ip);
+
+        if (pthread_create(&new_thread->thread_id, NULL, thread_handler, new_thread) != 0) {
+            free(new_thread);
             close(client_fd);
-            continue;
+        } else {
+            SLIST_INSERT_HEAD(&head, new_thread, entries);
         }
-        t_node->client_fd = client_fd;
-        t_node->client_addr = client_addr;
-        t_node->thread_complete = false;
 
-        pthread_create(&t_node->thread_id, NULL, thread_handler, t_node);
-        SLIST_INSERT_HEAD(&head, t_node, entries);
-
-        // Periodically join completed threads
-        struct thread_data *it, *tmp_it;
-        SLIST_FOREACH_SAFE(it, &head, entries, tmp_it) {
-            if (it->thread_complete) {
-                pthread_join(it->thread_id, NULL);
-                SLIST_REMOVE(&head, it, thread_data, entries);
-                free(it);
+        // Clean up finished threads
+        struct thread_data_s *td, *tmp_td;
+        td = SLIST_FIRST(&head);
+        while (td != NULL) {
+            tmp_td = SLIST_NEXT(td, entries);
+            if (td->complete_flag) {
+                pthread_join(td->thread_id, NULL);
+                SLIST_REMOVE(&head, td, thread_data_s, entries);
+                free(td);
             }
+            td = tmp_td;
         }
     }
 
-    // Cleanup logic
-    pthread_join(timer_tid, NULL);
+    // Shutdown and join remaining threads
+    pthread_join(timer_thread, NULL);
+    struct thread_data_s *td;
     while (!SLIST_EMPTY(&head)) {
-        struct thread_data* it = SLIST_FIRST(&head);
-        pthread_join(it->thread_id, NULL);
+        td = SLIST_FIRST(&head);
+        pthread_join(td->thread_id, NULL);
         SLIST_REMOVE_HEAD(&head, entries);
-        free(it);
+        free(td);
     }
 
-    pthread_mutex_destroy(&file_mutex);
     close(server_fd);
     remove(DATA_FILE);
-    syslog(LOG_INFO, "Server shutdown complete");
+    pthread_mutex_destroy(&file_mutex);
     closelog();
-
     return 0;
 }

@@ -43,7 +43,7 @@ volatile sig_atomic_t keep_running = 1;
 // Signal handler for graceful shutdown
 void signal_handler(int sig) {
     if (sig == SIGINT || sig == SIGTERM) {
-        syslog(LOG_INFO, "Caught signal, exiting");
+        // syslog(LOG_INFO, "Caught signal, exiting");
         keep_running = 0;
         if (server_fd != -1) {
             shutdown(server_fd, SHUT_RDWR);

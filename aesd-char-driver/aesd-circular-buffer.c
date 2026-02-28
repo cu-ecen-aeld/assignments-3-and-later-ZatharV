@@ -32,6 +32,35 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
     /**
     * TODO: implement per description
     */
+
+    // Check for NULL buffer
+    if(buffer == NULL)
+    {
+        return NULL;
+    }
+
+    // Check if buffer is empty
+    if((buffer->in_offs == buffer->out_offs) && !buffer->full)
+    {
+        return NULL;
+    }
+
+    // do while will only work if buffer is not empty
+    size_t curr_offset = 0;
+    uint8_t index = buffer->out_offs;
+    do
+    {
+        if(char_offset < (curr_offset + buffer->entry[index].size))
+        {
+            // Got the correct index
+            *entry_offset_byte_rtn = char_offset - curr_offset; // Get offset in that index
+            return &buffer->entry[index];   // Return the index structure
+        }
+        curr_offset += buffer->entry[index].size;
+        index = (index + 1)%AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    } while (index != buffer->in_offs);
+    
+    
     return NULL;
 }
 
@@ -47,6 +76,30 @@ void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const s
     /**
     * TODO: implement per description
     */
+
+    // Check for NULL pointers before dereferencing
+    if((buffer == NULL) || (add_entry == NULL))
+    {
+        return;
+    }
+
+    // Add entry
+    buffer->entry[buffer->in_offs] = *add_entry;
+
+    // Add and wrap around
+    buffer->in_offs = (buffer->in_offs + 1)%AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+
+    // If full, increment out index
+    if(buffer->full)
+    {
+        buffer->out_offs = (buffer->out_offs + 1)%AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    }
+
+    // Check if buffer is full
+    if(buffer->in_offs == buffer->out_offs)
+    {
+        buffer->full = true;
+    }
 }
 
 /**

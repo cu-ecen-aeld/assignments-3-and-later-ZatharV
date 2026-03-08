@@ -168,11 +168,19 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
             memmove(dev->partial_write_buf,
                     dev->partial_write_buf + cmd_len,
                     remaining);
+            dev->partial_write_size = remaining;
+        } else {
+            /* No remaining data — explicitly free to avoid krealloc(ptr,0)
+             * undefined behavior on some kernel versions */
+            kfree(dev->partial_write_buf);
+            dev->partial_write_buf  = NULL;
+            dev->partial_write_size = 0;
         }
-        dev->partial_write_size = remaining;
 
         /* Check for another complete command in the remaining data */
-        newline_pos = memchr(dev->partial_write_buf, '\n', dev->partial_write_size);
+        newline_pos = (dev->partial_write_size > 0) ?
+                      memchr(dev->partial_write_buf, '\n', dev->partial_write_size) :
+                      NULL;
     }
 
     /*

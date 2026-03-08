@@ -28,9 +28,6 @@
 
 struct aesd_dev
 {
-    /**
-     * TODO: Add structure(s) and locks needed to complete assignment requirements
-     */
     struct cdev cdev;     /* Char device structure      */
     struct aesd_circular_buffer buffer;
     size_t partial_write_size;
@@ -38,11 +35,12 @@ struct aesd_dev
     char *partial_write_buf;
 };
 
-/* Prototypes to fix -Wmissing-prototypes */
+/* Prototypes */
 int aesd_open(struct inode *inode, struct file *filp);
 int aesd_release(struct inode *inode, struct file *filp);
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence);
 int aesd_init_module(void);
 void aesd_cleanup_module(void);
 

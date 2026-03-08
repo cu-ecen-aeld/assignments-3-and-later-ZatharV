@@ -187,9 +187,33 @@ out:
     return retval;
 }
 
+/**
+ * llseek: Allow seeking so drivertest.sh can lseek to 0 after writing
+ * and read back from the beginning. Only SEEK_SET and SEEK_CUR are supported.
+ * SEEK_END is not meaningful for this device.
+ */
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+{
+    loff_t new_pos;
+    switch (whence) {
+        case SEEK_SET:
+            new_pos = offset;
+            break;
+        case SEEK_CUR:
+            new_pos = filp->f_pos + offset;
+            break;
+        default:
+            return -EINVAL;
+    }
+    if (new_pos < 0)
+        return -EINVAL;
+    filp->f_pos = new_pos;
+    return new_pos;
+}
+
 struct file_operations aesd_fops = {
     .owner   = THIS_MODULE,
-    .llseek  = no_llseek,   /* FIX: Explicitly disable llseek — driver manages f_pos */
+    .llseek  = aesd_llseek,
     .read    = aesd_read,
     .write   = aesd_write,
     .open    = aesd_open,

@@ -1,9 +1,9 @@
 /*
-* aesdchar.h
-*
-*  Created on: Oct 23, 2019
-*      Author: Dan Walkes
-*/
+ * aesdchar.h
+ *
+ *  Created on: Oct 23, 2019
+ *      Author: Dan Walkes
+ */
 
 #ifndef AESD_CHAR_DRIVER_AESDCHAR_H_
 #define AESD_CHAR_DRIVER_AESDCHAR_H_
@@ -28,12 +28,20 @@
 
 struct aesd_dev
 {
-    struct aesd_circular_buffer buffer;   /* Circular buffer for storing write commands */
-    char *partial_write_buf;              /* Buffer for incomplete (no \n) write data */
-    size_t partial_write_size;            /* Size of partial write data */
-    struct mutex lock;                    /* Mutex for thread-safe access */
-    struct cdev cdev;                     /* Char device structure */
+    struct cdev cdev;     /* Char device structure      */
+    struct aesd_circular_buffer buffer;
+    size_t partial_write_size;
+    struct mutex lock;
+    char *partial_write_buf;
 };
 
+/* Prototypes */
+int aesd_open(struct inode *inode, struct file *filp);
+int aesd_release(struct inode *inode, struct file *filp);
+ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
+ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence);
+int aesd_init_module(void);
+void aesd_cleanup_module(void);
 
 #endif /* AESD_CHAR_DRIVER_AESDCHAR_H_ */

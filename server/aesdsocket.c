@@ -2,7 +2,7 @@
  * @file      aesdsocket.c
  * @author    Atharv More
  * @brief     Full implementation of multi-threaded socket server with 
- * synchronized file I/O and periodic timestamping.
+ * conditional support for the aesdchar device driver.
  * @date      02/14/2026
  */
 
@@ -23,8 +23,19 @@
 #include <time.h>
 
 #define PORT 9000
-#define DATA_FILE "/var/tmp/aesdsocketdata"
 #define BUF_SIZE 1024
+
+// Assignment 8 Build Switch: Default to 1 (Char Device)
+#ifndef USE_AESD_CHAR_DEVICE
+    #define USE_AESD_CHAR_DEVICE 1
+#endif
+
+// Define path based on the build switch
+#if USE_AESD_CHAR_DEVICE
+    #define DATA_FILE "/dev/aesdchar"
+#else
+    #define DATA_FILE "/var/tmp/aesdsocketdata"
+#endif
 
 // Thread management structure
 struct thread_data_s {
@@ -43,7 +54,6 @@ volatile sig_atomic_t keep_running = 1;
 // Signal handler for graceful shutdown
 void signal_handler(int sig) {
     if (sig == SIGINT || sig == SIGTERM) {
-        // syslog(LOG_INFO, "Caught signal, exiting");
         keep_running = 0;
         if (server_fd != -1) {
             shutdown(server_fd, SHUT_RDWR);
@@ -52,11 +62,11 @@ void signal_handler(int sig) {
 }
 
 /**
- * Timer thread: Appends RFC 2822 timestamp every 10 seconds
+ * Timer thread: Only included if NOT using the char device
  */
+#if !USE_AESD_CHAR_DEVICE
 void* timestamp_handler(void* thread_param) {
     while (keep_running) {
-        // Sleep in 1s increments to allow faster exit on shutdown
         for (int i = 0; i < 10 && keep_running; i++) {
             sleep(1);
         }
@@ -70,7 +80,6 @@ void* timestamp_handler(void* thread_param) {
         time(&rawtime);
         info = localtime(&rawtime);
         
-        // RFC 2822 format: %a, %d %b %Y %T %z
         strftime(time_buf, sizeof(time_buf), "%a, %d %b %Y %T %z", info);
         int len = snprintf(final_str, sizeof(final_str), "timestamp:%s\n", time_buf);
 
@@ -84,9 +93,10 @@ void* timestamp_handler(void* thread_param) {
     }
     return NULL;
 }
+#endif
 
 /**
- * Connection thread: Handles individual client RX/TX
+ * Connection thread: Handles client RX/TX logic
  */
 void* thread_handler(void* thread_param) {
     struct thread_data_s* data = (struct thread_data_s*)thread_param;
@@ -97,7 +107,6 @@ void* thread_handler(void* thread_param) {
     size_t total_received = 0;
     size_t current_buf_size = BUF_SIZE;
 
-    // Receive data until newline
     while (keep_running) {
         bytes_received = recv(data->client_fd, recv_buffer + total_received, current_buf_size - total_received - 1, 0);
         if (bytes_received <= 0) break;
@@ -118,6 +127,7 @@ void* thread_handler(void* thread_param) {
     if (total_received > 0) {
         pthread_mutex_lock(&file_mutex);
         
+        // Requirement: Only open file when it is actually accessed
         int fd = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
         if (fd != -1) {
             write(fd, recv_buffer, total_received);
@@ -145,7 +155,7 @@ int main(int argc, char *argv[]) {
     int daemon_mode = (argc > 1 && strcmp(argv[1], "-d") == 0);
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
-    struct sigaction sig_action = {.sa_handler = signal_handler};
+    struct sigaction sig_action = { .sa_handler = signal_handler };
     sigaction(SIGINT, &sig_action, NULL);
     sigaction(SIGTERM, &sig_action, NULL);
 
@@ -153,7 +163,7 @@ int main(int argc, char *argv[]) {
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(PORT), .sin_addr.s_addr = INADDR_ANY};
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(PORT), .sin_addr.s_addr = INADDR_ANY };
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("Bind failed");
         return -1;
@@ -177,8 +187,10 @@ int main(int argc, char *argv[]) {
     SLIST_HEAD(slisthead, thread_data_s) head;
     SLIST_INIT(&head);
 
+#if !USE_AESD_CHAR_DEVICE
     pthread_t timer_thread;
     pthread_create(&timer_thread, NULL, timestamp_handler, NULL);
+#endif
 
     while(keep_running) {
         struct sockaddr_in client_addr;
@@ -204,7 +216,6 @@ int main(int argc, char *argv[]) {
             SLIST_INSERT_HEAD(&head, new_thread, entries);
         }
 
-        // Clean up finished threads
         struct thread_data_s *td, *tmp_td;
         td = SLIST_FIRST(&head);
         while (td != NULL) {
@@ -218,8 +229,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Shutdown and join remaining threads
+#if !USE_AESD_CHAR_DEVICE
     pthread_join(timer_thread, NULL);
+#endif
+
     struct thread_data_s *td;
     while (!SLIST_EMPTY(&head)) {
         td = SLIST_FIRST(&head);
@@ -229,7 +242,12 @@ int main(int argc, char *argv[]) {
     }
 
     close(server_fd);
+
+    // Requirement: Ensure you do NOT remove the /dev/aesdchar endpoint after exiting
+#if !USE_AESD_CHAR_DEVICE
     remove(DATA_FILE);
+#endif
+
     pthread_mutex_destroy(&file_mutex);
     closelog();
     return 0;

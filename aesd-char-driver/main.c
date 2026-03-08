@@ -46,41 +46,60 @@ int aesd_release(struct inode *inode, struct file *filp)
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                   loff_t *f_pos)
 {
-    /* FIX: Declare all variables at top of function (kernel C89 style) */
-    struct aesd_dev *dev = filp->private_data;
+    struct aesd_dev *dev;
     struct aesd_buffer_entry *entry;
-    size_t entry_offset = 0;
+    size_t entry_offset;
     size_t bytes_to_copy;
-    ssize_t retval = 0;
+    size_t total_copied;
+    ssize_t retval;
+    loff_t cur_pos;
+    char __user *cur_user;
+
+    dev = filp->private_data;
+    entry = NULL;
+    entry_offset = 0;
+    bytes_to_copy = 0;
+    total_copied = 0;
+    retval = 0;
+    cur_pos = *f_pos;
+    cur_user = buf;
 
     PDEBUG("read %zu bytes with offset %lld", count, *f_pos);
 
     if (mutex_lock_interruptible(&dev->lock))
         return -ERESTARTSYS;
 
-    entry = aesd_circular_buffer_find_entry_offset_for_fpos(
-                &dev->buffer, *f_pos, &entry_offset);
+    /*
+     * Read may span multiple circular buffer entries.
+     * We loop until we either satisfy 'count' bytes or run out of data.
+     */
+    while (total_copied < count) {
+        entry = aesd_circular_buffer_find_entry_offset_for_fpos(
+                    &dev->buffer, cur_pos, &entry_offset);
 
-    if (entry == NULL) {
-        /* No data available at this offset — return 0 (EOF) */
-        retval = 0;
-        goto out;
+        if (entry == NULL) {
+            /* No more data available from this position */
+            break;
+        }
+
+        bytes_to_copy = entry->size - entry_offset;
+        if (bytes_to_copy > (count - total_copied))
+            bytes_to_copy = count - total_copied;
+
+        if (copy_to_user(cur_user,
+                         entry->buffptr + entry_offset,
+                         bytes_to_copy)) {
+            retval = -EFAULT;
+            goto out;
+        }
+
+        cur_pos    += bytes_to_copy;
+        cur_user   += bytes_to_copy;
+        total_copied += bytes_to_copy;
     }
 
-    /* How many bytes available in this entry from entry_offset */
-    bytes_to_copy = entry->size - entry_offset;
-
-    /* Limit to what caller requested */
-    if (bytes_to_copy > count)
-        bytes_to_copy = count;
-
-    if (copy_to_user(buf, entry->buffptr + entry_offset, bytes_to_copy)) {
-        retval = -EFAULT;
-        goto out;
-    }
-
-    *f_pos += bytes_to_copy;
-    retval = bytes_to_copy;
+    *f_pos = cur_pos;
+    retval = total_copied;
 
 out:
     mutex_unlock(&dev->lock);
@@ -90,7 +109,6 @@ out:
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                    loff_t *f_pos)
 {
-    /* FIX: All variables declared at top of function */
     struct aesd_dev *dev = filp->private_data;
     char *kernel_buf  = NULL;
     char *new_partial = NULL;
@@ -136,12 +154,13 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     newline_pos = memchr(dev->partial_write_buf, '\n', dev->partial_write_size);
 
     while (newline_pos != NULL) {
-        /* FIX: Declare variables at top of block scope */
-        size_t cmd_len  = (size_t)(newline_pos - dev->partial_write_buf) + 1; /* include \n */
+        size_t cmd_len;
         size_t remaining;
         char *cmd_buf;
         const char *to_free;
         struct aesd_buffer_entry new_entry;
+
+        cmd_len  = (size_t)(newline_pos - dev->partial_write_buf) + 1; /* include \n */
 
         cmd_buf = kmalloc(cmd_len, GFP_KERNEL);
         if (!cmd_buf) {
@@ -153,11 +172,6 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         new_entry.buffptr = cmd_buf;
         new_entry.size    = cmd_len;
 
-        /*
-         * FIX: Use the return value of aesd_circular_buffer_add_entry to get
-         * the evicted entry's buffptr. This is the correct and safe way —
-         * avoids the double-free risk of manually checking buffer->full beforehand.
-         */
         to_free = aesd_circular_buffer_add_entry(&dev->buffer, &new_entry);
         if (to_free)
             kfree((void *)to_free);
@@ -170,8 +184,6 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                     remaining);
             dev->partial_write_size = remaining;
         } else {
-            /* No remaining data — explicitly free to avoid krealloc(ptr,0)
-             * undefined behavior on some kernel versions */
             kfree(dev->partial_write_buf);
             dev->partial_write_buf  = NULL;
             dev->partial_write_size = 0;
@@ -271,7 +283,6 @@ int aesd_init_module(void)
 
 void aesd_cleanup_module(void)
 {
-    /* FIX: Declare variables at top of function */
     dev_t devno = MKDEV(aesd_major, aesd_minor);
     uint8_t index;
     struct aesd_buffer_entry *entry;

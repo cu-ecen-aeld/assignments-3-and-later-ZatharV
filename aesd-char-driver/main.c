@@ -46,65 +46,65 @@ int aesd_release(struct inode *inode, struct file *filp)
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                   loff_t *f_pos)
 {
-    struct aesd_dev *dev;
+    struct aesd_dev *dev = filp->private_data;
     struct aesd_buffer_entry *entry;
-    size_t entry_offset;
+    size_t entry_offset = 0;
     size_t bytes_to_copy;
-    size_t total_copied;
-    ssize_t retval;
-    loff_t cur_pos;
-    char __user *cur_user;
-
-    dev = filp->private_data;
-    entry = NULL;
-    entry_offset = 0;
-    bytes_to_copy = 0;
-    total_copied = 0;
-    retval = 0;
-    cur_pos = *f_pos;
-    cur_user = buf;
+    size_t copied = 0;
+    loff_t pos = *f_pos;
+    ssize_t retval = 0;
+    uint8_t idx;
+    size_t total_size = 0;
 
     PDEBUG("read %zu bytes with offset %lld", count, *f_pos);
 
     if (mutex_lock_interruptible(&dev->lock))
         return -ERESTARTSYS;
 
-    /*
-     * Read may span multiple circular buffer entries.
-     * We loop until we either satisfy 'count' bytes or run out of data.
-     */
-    while (total_copied < count) {
-        entry = aesd_circular_buffer_find_entry_offset_for_fpos(
-                    &dev->buffer, cur_pos, &entry_offset);
+    /* ---- FIX #1: compute total size of all entries ---- */
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->buffer, idx) {
+        if (entry->buffptr)
+            total_size += entry->size;
+    }
 
-        if (entry == NULL) {
-            /* No more data available from this position */
+    /* ---- FIX #2: if f_pos beyond end, return EOF ---- */
+    if (pos >= total_size) {
+        retval = 0;
+        goto out;
+    }
+
+    /* ---- FIX #3: read across entries until count satisfied ---- */
+    while (copied < count) {
+
+        entry = aesd_circular_buffer_find_entry_offset_for_fpos(
+                    &dev->buffer, pos, &entry_offset);
+
+        if (!entry)
             break;
-        }
 
         bytes_to_copy = entry->size - entry_offset;
-        if (bytes_to_copy > (count - total_copied))
-            bytes_to_copy = count - total_copied;
+        if (bytes_to_copy > (count - copied))
+            bytes_to_copy = count - copied;
 
-        if (copy_to_user(cur_user,
+        if (copy_to_user(buf + copied,
                          entry->buffptr + entry_offset,
                          bytes_to_copy)) {
             retval = -EFAULT;
             goto out;
         }
 
-        cur_pos    += bytes_to_copy;
-        cur_user   += bytes_to_copy;
-        total_copied += bytes_to_copy;
+        copied += bytes_to_copy;
+        pos    += bytes_to_copy;
     }
 
-    *f_pos = cur_pos;
-    retval = total_copied;
+    *f_pos = pos;
+    retval = copied;
 
 out:
     mutex_unlock(&dev->lock);
     return retval;
 }
+
 
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                    loff_t *f_pos)

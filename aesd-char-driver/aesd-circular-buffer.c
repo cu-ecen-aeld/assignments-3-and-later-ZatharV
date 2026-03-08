@@ -26,43 +26,53 @@
  * @return the struct aesd_buffer_entry structure representing the position described by char_offset, or
  * NULL if this position is not available in the buffer (not enough data is written).
  */
-struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct aesd_circular_buffer *buffer,
-            size_t char_offset, size_t *entry_offset_byte_rtn )
+struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(
+        struct aesd_circular_buffer *buffer,
+        size_t char_offset,
+        size_t *entry_offset_byte_rtn)
 {
-    /**
-    * TODO: implement per description
-    */
-
-    // Check for NULL buffer
-    if(buffer == NULL)
-    {
-        return NULL;
-    }
-
-    // Check if buffer is empty
-    if((buffer->in_offs == buffer->out_offs) && !buffer->full)
-    {
-        return NULL;
-    }
-
-    // do while will only work if buffer is not empty
     size_t curr_offset = 0;
-    uint8_t index = buffer->out_offs;
-    do
-    {
-        if(char_offset < (curr_offset + buffer->entry[index].size))
-        {
-            // Got the correct index
-            *entry_offset_byte_rtn = char_offset - curr_offset; // Get offset in that index
-            return &buffer->entry[index];   // Return the index structure
+    uint8_t idx;
+    uint8_t i;
+    uint8_t count;
+
+    if (!buffer || !entry_offset_byte_rtn)
+        return NULL;
+
+    /* Empty buffer: in_offs == out_offs and not full */
+    if ((buffer->in_offs == buffer->out_offs) && !buffer->full)
+        return NULL;
+
+    /* How many valid entries are there? */
+    if (buffer->full) {
+        count = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    } else if (buffer->in_offs >= buffer->out_offs) {
+        count = buffer->in_offs - buffer->out_offs;
+    } else {
+        count = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED
+                - buffer->out_offs
+                + buffer->in_offs;
+    }
+
+    /* Walk entries from oldest (out_offs) forward, count bytes */
+    for (i = 0; i < count; i++) {
+        struct aesd_buffer_entry *entry;
+
+        idx = (buffer->out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        entry = &buffer->entry[idx];
+
+        if (char_offset < curr_offset + entry->size) {
+            *entry_offset_byte_rtn = char_offset - curr_offset;
+            return entry;
         }
-        curr_offset += buffer->entry[index].size;
-        index = (index + 1)%AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
-    } while (index != buffer->in_offs);
-    
-    
+
+        curr_offset += entry->size;
+    }
+
+    /* char_offset beyond total data */
     return NULL;
 }
+
 
 /**
 * Adds entry @param add_entry to @param buffer in the location specified in buffer->in_offs.

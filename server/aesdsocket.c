@@ -42,7 +42,7 @@ struct thread_data_s {
     pthread_t thread_id;
     int client_fd;
     char client_ip[INET_ADDRSTRLEN];
-    int complete_flag; 
+    int complete_flag;
     SLIST_ENTRY(thread_data_s) entries;
 };
 
@@ -79,7 +79,7 @@ void* timestamp_handler(void* thread_param) {
 
         time(&rawtime);
         info = localtime(&rawtime);
-        
+
         strftime(time_buf, sizeof(time_buf), "%a, %d %b %Y %T %z", info);
         int len = snprintf(final_str, sizeof(final_str), "timestamp:%s\n", time_buf);
 
@@ -107,17 +107,21 @@ void* thread_handler(void* thread_param) {
     size_t total_received = 0;
     size_t current_buf_size = BUF_SIZE;
 
+    // Receive data until we get a newline terminator
     while (keep_running) {
-        bytes_received = recv(data->client_fd, recv_buffer + total_received, current_buf_size - total_received - 1, 0);
+        bytes_received = recv(data->client_fd, recv_buffer + total_received,
+                              current_buf_size - total_received - 1, 0);
         if (bytes_received <= 0) break;
 
         total_received += bytes_received;
         recv_buffer[total_received] = '\0';
 
+        // Check if we received a newline (end of command)
         if (memchr(recv_buffer + (total_received - bytes_received), '\n', bytes_received)) {
             break;
         }
 
+        // Grow buffer if needed
         current_buf_size += BUF_SIZE;
         char *new_ptr = realloc(recv_buffer, current_buf_size);
         if (!new_ptr) goto cleanup;
@@ -126,8 +130,36 @@ void* thread_handler(void* thread_param) {
 
     if (total_received > 0) {
         pthread_mutex_lock(&file_mutex);
-        
-        // Requirement: Only open file when it is actually accessed
+
+        // FIX 1: Write and read use SEPARATE file descriptors.
+        // FIX 2: No O_CREAT on char device; no lseek needed since
+        //        opening a new fd for read starts at position 0 (driver manages f_pos).
+#if USE_AESD_CHAR_DEVICE
+        // Write to char device
+        int wfd = open(DATA_FILE, O_WRONLY | O_APPEND, 0644);
+        if (wfd != -1) {
+            write(wfd, recv_buffer, total_received);
+            close(wfd);
+        } else {
+            syslog(LOG_ERR, "Failed to open %s for write: %s", DATA_FILE, strerror(errno));
+            pthread_mutex_unlock(&file_mutex);
+            goto cleanup;
+        }
+
+        // Read back entire content from char device (new fd starts at f_pos=0)
+        int rfd = open(DATA_FILE, O_RDONLY);
+        if (rfd != -1) {
+            char send_buf[BUF_SIZE];
+            ssize_t r_bytes;
+            while ((r_bytes = read(rfd, send_buf, BUF_SIZE)) > 0) {
+                send(data->client_fd, send_buf, r_bytes, 0);
+            }
+            close(rfd);
+        } else {
+            syslog(LOG_ERR, "Failed to open %s for read: %s", DATA_FILE, strerror(errno));
+        }
+#else
+        // Regular file: write, seek to start, read back
         int fd = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
         if (fd != -1) {
             write(fd, recv_buffer, total_received);
@@ -140,6 +172,8 @@ void* thread_handler(void* thread_param) {
             }
             close(fd);
         }
+#endif
+
         pthread_mutex_unlock(&file_mutex);
     }
 
@@ -160,12 +194,23 @@ int main(int argc, char *argv[]) {
     sigaction(SIGTERM, &sig_action, NULL);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        syslog(LOG_ERR, "Failed to create socket: %s", strerror(errno));
+        return -1;
+    }
+
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(PORT), .sin_addr.s_addr = INADDR_ANY };
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(PORT),
+        .sin_addr.s_addr = INADDR_ANY
+    };
+
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("Bind failed");
+        syslog(LOG_ERR, "Bind failed: %s", strerror(errno));
+        close(server_fd);
         return -1;
     }
 
@@ -192,21 +237,25 @@ int main(int argc, char *argv[]) {
     pthread_create(&timer_thread, NULL, timestamp_handler, NULL);
 #endif
 
-    while(keep_running) {
+    while (keep_running) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-        
+
         if (client_fd == -1) {
             if (errno == EINTR || !keep_running) break;
             continue;
         }
 
         struct thread_data_s* new_thread = malloc(sizeof(struct thread_data_s));
+        if (!new_thread) {
+            close(client_fd);
+            continue;
+        }
         new_thread->client_fd = client_fd;
         new_thread->complete_flag = 0;
         inet_ntop(AF_INET, &client_addr.sin_addr, new_thread->client_ip, INET_ADDRSTRLEN);
-        
+
         syslog(LOG_INFO, "Accepted connection from %s", new_thread->client_ip);
 
         if (pthread_create(&new_thread->thread_id, NULL, thread_handler, new_thread) != 0) {
@@ -216,6 +265,7 @@ int main(int argc, char *argv[]) {
             SLIST_INSERT_HEAD(&head, new_thread, entries);
         }
 
+        // Clean up completed threads
         struct thread_data_s *td, *tmp_td;
         td = SLIST_FIRST(&head);
         while (td != NULL) {
@@ -233,6 +283,7 @@ int main(int argc, char *argv[]) {
     pthread_join(timer_thread, NULL);
 #endif
 
+    // Join any remaining threads
     struct thread_data_s *td;
     while (!SLIST_EMPTY(&head)) {
         td = SLIST_FIRST(&head);
@@ -243,7 +294,8 @@ int main(int argc, char *argv[]) {
 
     close(server_fd);
 
-    // Requirement: Ensure you do NOT remove the /dev/aesdchar endpoint after exiting
+    // FIX 3: Do NOT remove /dev/aesdchar on exit (it's a device node, not a file)
+    // Only remove the data file when NOT using the char device
 #if !USE_AESD_CHAR_DEVICE
     remove(DATA_FILE);
 #endif

@@ -1,8 +1,9 @@
 # Author: Atharv More
-#aesdsocket makefile
+# aesdsocket makefile
 
 CC = $(CROSS_COMPILE)gcc
-CFLAGS = -Wall -Werror -g -O0
+# FIX: Explicitly define USE_AESD_CHAR_DEVICE=1 for Assignment 8
+CFLAGS = -Wall -Werror -g -O0 -DUSE_AESD_CHAR_DEVICE=1
 LDFLAGS ?= -pthread
 
 all: aesdsocket
